@@ -10,7 +10,7 @@ from . import source
 from .alerts import compute_alerts
 from .analysis import daily_flows, observed_intervals
 from .config import SETTINGS, SOURCE_URL, Settings
-from .forecast import run_forecast
+from .forecast import MultiImageIndex, estimate_tenor, multi_image_index, run_forecasts
 from .imputation import build_panel, impute_rows, observed_matrix
 from .storage import Store, now_local
 
@@ -33,6 +33,7 @@ class History:
     fc_totals: pd.DataFrame
     fc_buckets: pd.DataFrame
     alerts: pd.DataFrame
+    index: MultiImageIndex     # depreciation index over calendar time (alpha from settings)
 
     @property
     def empty(self) -> bool:
@@ -78,8 +79,8 @@ def _forecast_for(store: Store, asof: pd.Timestamp, all_snaps: pd.DataFrame, set
     panel, _, aom = build_panel(snaps, settings)
     if panel.empty:
         return
-    total, buckets, _, meta = run_forecast(panel, aom, snaps, settings)
-    store.save_forecast(asof, total, buckets, meta)
+    res = run_forecasts(panel, aom, snaps, settings)
+    store.save_forecast(asof, res.totals, res.buckets, res.meta)
 
 
 def refresh_forecasts(store: Store, settings: Settings = SETTINGS, rebuild: bool = False) -> int:
@@ -106,14 +107,14 @@ def load_history(store: Store, settings: Settings = SETTINGS) -> History:
     flows = daily_flows(panel, imputed, aom)
     intervals = observed_intervals(obs, aom) if len(obs) > 1 else pd.DataFrame()
     totals, buckets = store.load_forecasts()
+    index = multi_image_index(panel, aom, settings.alpha, estimate_tenor(snaps, settings), settings)
     return History(catalog, snaps, obs, panel, imputed, aom, flows, intervals,
-                   store.vintages(), totals, buckets, store.alerts())
+                   store.vintages(), totals, buckets, store.alerts(), index)
 
 
 def refresh_alerts(store: Store, h: History, settings: Settings = SETTINGS) -> pd.DataFrame:
-    intervals = h.intervals if not h.intervals.empty else pd.DataFrame(
-        columns=["date", "redeemed_per_day", "issued_per_day"])
-    fresh = compute_alerts(h.catalog, intervals, h.vintages, h.fc_totals, h.actual_obs, settings)
+    fresh = compute_alerts(h.catalog, h.intervals, h.index.series, settings.alpha, h.vintages,
+                           h.fc_totals, h.actual_obs, settings)
     return store.save_alerts(fresh)
 
 

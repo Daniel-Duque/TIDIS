@@ -47,45 +47,25 @@ def observed_intervals(obs: pd.DataFrame, alive_on_maturity: bool) -> pd.DataFra
     for a_day, b_day in zip(obs.index[:-1], obs.index[1:]):
         days = (b_day - a_day).days
         f = decompose(obs.loc[a_day], obs.loc[b_day], b_day, alive_on_maturity)
+        prev_total = float(obs.loc[a_day].sum())
         rows.append({"date": b_day, "prev_date": a_day, "days": days, **f,
                      "redeemed_per_day": f["redeemed"] / days, "issued_per_day": f["issued"] / days,
-                     "total": float(obs.loc[b_day].sum())})
+                     "prev_total": prev_total, "total": float(obs.loc[b_day].sum())})
     return pd.DataFrame(rows)
 
 
-def month_profile(image: pd.Series) -> pd.Series:
-    """Image aggregated by maturity month (what the original app plotted)."""
-    image = image[image > 0]
-    if image.empty:
-        return pd.Series(dtype=float)
-    return image.groupby(image.index.to_period("M")).sum()
-
-
-def compare_images(a: pd.Series, b: pd.Series, a_day, b_day, alive_on_maturity: bool) -> pd.DataFrame:
-    """Per maturity month comparison of two images, with the change decomposed."""
+def compare_images(a: pd.Series, b: pd.Series, b_day, alive_on_maturity: bool) -> pd.DataFrame:
+    """Daily comparison of two images: one row per maturity date, with the change decomposed."""
     idx = a.index.union(b.index)
     a, b = a.reindex(idx, fill_value=0.0), b.reindex(idx, fill_value=0.0)
-    per_bucket = []
-    for m in idx:
-        per_bucket.append({"maturity_date": m, "month": m.to_period("M"), "balance_a": a[m],
-                           "balance_b": b[m], **decompose(a[[m]], b[[m]], pd.Timestamp(b_day), alive_on_maturity)})
-    df = pd.DataFrame(per_bucket)
-    if df.empty:
-        return df
-    out = df.groupby("month")[["balance_a", "balance_b", "issued", "redeemed", "matured"]].sum()
+    delta = (b - a).to_numpy()
+    matured = (delta < 0) & (b.to_numpy() == 0) & ~is_alive(idx.values, pd.Timestamp(b_day), alive_on_maturity)
+    out = pd.DataFrame({
+        "balance_a": a.to_numpy(), "balance_b": b.to_numpy(),
+        "issued": np.clip(delta, 0, None),
+        "redeemed": np.where(~matured, np.clip(-delta, 0, None), 0.0),
+        "matured": np.where(matured, -delta, 0.0),
+    }, index=pd.DatetimeIndex(idx, name="maturity_date"))
     out["change"] = out["balance_b"] - out["balance_a"]
-    out["change_pct"] = np.where(out["balance_a"] > 0, 100 * out["change"] / out["balance_a"].where(out["balance_a"] > 0), np.nan)
-    return out[(out[["balance_a", "balance_b"]].sum(axis=1) > 0)]
-
-
-def robust_z(value: float, history: pd.Series) -> float:
-    """Modified z-score (Iglewicz & Hoaglin) - robust to the spiky nature of tax payments."""
-    history = history.dropna()
-    if len(history) == 0:
-        return np.nan
-    med = history.median()
-    mad = (history - med).abs().median()
-    if mad == 0:
-        mad = history.std() or (abs(med) or 1.0)
-        return (value - med) / mad
-    return 0.6745 * (value - med) / mad
+    out["change_pct"] = 100 * out["change"] / out["balance_a"].where(out["balance_a"] > 0)
+    return out[(out["balance_a"] > 0) | (out["balance_b"] > 0)]

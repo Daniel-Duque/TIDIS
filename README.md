@@ -12,17 +12,20 @@ python -m pytest tests -q  # tests (synthetic data, no internet needed)
 
 ## How it works
 
+Everything is **daily**: one image per day, one bucket per maturity date.
+
 | Step | What happens | Where |
 |---|---|---|
 | Download | `caracteristicas-financieras-titulos-vigentes.xlsx`; the header row is located automatically, the cut date is read from the title rows if present | `tidis/source.py` |
 | Image of the day | TIDIS rows (title, issue date, maturity, balance) saved as `data/snapshots/YYYY-MM-DD.parquet`, plus the original file in `data/raw/` | `tidis/storage.py` |
 | Row imputation | a title with missing balance/maturity is completed from the previous image of the same title | `tidis/imputation.py` |
 | Day imputation | days without image are rebuilt title by title: continuing titles interpolated, titles that mature in the gap stay flat until maturity, new titles appear on their issue date | `tidis/imputation.py` |
-| Comparing images | every change is split into **issued**, **used** (redeemed for taxes before maturity) and **matured unused**; the three add up exactly to the change | `tidis/analysis.py` |
-| Forecast | usage rate per days-to-maturity bucket estimated from the history, projected per maturity date, plus new issuance at the average rate. One forecast per image is saved once and never overwritten (`data/forecasts/`), so the forecasts themselves have a history | `tidis/forecast.py` |
-| Alerts | unusual usage/issuance (robust z-score), revisions between consecutive forecasts (+30/+90/+180 d and "will expire unused"), error of yesterday's forecast vs today's image, imputed days/rows. Kept in `data/alerts.csv` with first-detection time | `tidis/alerts.py` |
+| Comparing images | every change is split into **issued**, **used** (redeemed for taxes before maturity) and **matured unused**, per maturity date; the three add up exactly to the change | `tidis/analysis.py` |
+| Depreciation index | **single image**: balance by days since issue inside one image → curve 100 → x at maturity. **Multiple images**: daily fraction of the live stock used, chained into an index over time. Both are smoothed with **α** (weight of the newest day: small α = softer trend, 1 = no smoothing) | `tidis/forecast.py` |
+| Forecasts | both indices are projected per maturity date (depreciation, maturity, new issuance). One forecast per image and method is saved once and never overwritten (`data/forecasts/`), so the forecasts have their own history and measured accuracy. α can be changed live on the page and calibrated with a backtest | `tidis/forecast.py` |
+| Alerts | all **relative** to the value they describe, and the text says by how much: usage/issuance (% of balance) vs its smoothed level, daily change of the total, shift of the smoothed depreciation rate, forecast revisions, error of the previous forecast, single vs multiple-image gap, imputed days/rows. Stored in `data/alerts.csv` with the value, reference, % change and first-detection time | `tidis/alerts.py` |
 
-All thresholds and model parameters are in `tidis/config.py`.
+All thresholds and model parameters (α included) are in `tidis/config.py`.
 
 ## Daily images: schedule `collect.py`
 
@@ -49,7 +52,7 @@ jobs:
       - run: python collect.py || [ $? -eq 2 ]
       - run: |
           git config user.name "tidis-bot" && git config user.email "bot@users.noreply.github.com"
-          git add data && git commit -m "TIDIS image $(date +%F)" && git push || echo "nothing new"
+          git add data ':!data/cache' && git commit -m "TIDIS image $(date +%F)" && git push || echo "nothing new"
 ```
 
 **Persistence note:** on Streamlit Community Cloud the disk is wiped on every restart/redeploy.
@@ -58,4 +61,6 @@ volume. If the repo grows too much, set `keep_raw=False` in `tidis/config.py` (o
 
 Past files can be added from the page (sidebar → *Agregar archivo histórico*) or with
 `python collect.py --file old.xlsx --date 2026-03-31`; forecasts for those dates are made using only data
-available up to that date. After changing the model, `python collect.py --rebuild-forecasts` recomputes them.
+available up to that date. After changing the model or the default α, `python collect.py --rebuild-forecasts`
+recomputes them (forecasts saved by earlier versions only have the multiple-image method until rebuilt).
+`data/cache/` holds consolidated copies of the daily files for fast loading; it is rebuilt automatically and can be deleted.

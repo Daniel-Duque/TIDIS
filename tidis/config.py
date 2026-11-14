@@ -40,21 +40,29 @@ class Settings:
     imputation: str = "linear"        # "linear" or "ffill" for titles alive on both sides of a gap
     tenor_days: int = 365             # TIDIS validity (1 year); used when no issue date is available
 
-    # --- forecast ---------------------------------------------------------
-    lookback_days: int = 180          # history window used to estimate usage & issuance
+    # --- depreciation index & forecast --------------------------------------
+    alpha: float = 0.05               # smoothing of the depreciation index: weight of the newest day
+                                      # (small = softer trend, 1 = no smoothing)
+    lookback_days: int = 180          # window for the days-to-maturity shape (multi-image)
     horizon_days: int = 365           # forecast horizon (covers the whole life of current titles)
-    dtm_bin_days: int = 30            # usage rates are estimated per days-to-maturity bin
-    min_bin_transitions: int = 20     # below this, a bin falls back to the global rate
+    dtm_bin_days: int = 30            # days-to-maturity buckets of the shape
+    min_bin_transitions: int = 20     # below this, a bucket uses the average rate
     include_new_issuance: bool = True
+    issuance_window_days: int = 60    # new issuance = average of the last N days
 
-    # --- alerts -----------------------------------------------------------
-    z_threshold: float = 3.5          # modified z-score for unusual usage / issuance
-    min_history_flow_alerts: int = 10 # observed intervals needed before flow alerts fire
-    min_history_forecast_alerts: int = 15 # snapshots needed before forecast alerts fire
-    forecast_change_pct: float = 5.0  # revision between consecutive forecasts
-    forecast_error_pct: float = 3.0   # error of previous forecast vs today's actual
+    # --- alerts (all relative to the value they describe) ---------------------
+    usage_rel_pct: float = 100.0      # daily usage (% of balance) vs its smoothed level: +100% = double
+    issuance_rel_pct: float = 150.0   # daily issuance (% of balance) vs its smoothed level
+    balance_change_pct: float = 2.0   # daily change of the total balance
+    index_change_pct: float = 50.0    # change of the smoothed depreciation rate between images
+    forecast_change_pct: float = 5.0  # revision between consecutive forecasts (same target date)
+    unused_change_pct: float = 30.0   # revision of the balance expected to expire unused
+    forecast_error_pct: float = 3.0   # previous forecast vs today's observed balance
+    method_gap_pct: float = 15.0      # single-image vs multi-image forecast at +90 days
+    min_history_flow_alerts: int = 10 # observed intervals needed before flow / index alerts fire
+    min_history_forecast_alerts: int = 15  # images needed before forecast alerts fire
     check_horizons: tuple = (30, 90, 180)
-    stale_days: int = 3               # warn if latest snapshot is older than this
+    stale_days: int = 3               # warn if latest image is older than this
 
 
 SETTINGS = Settings()

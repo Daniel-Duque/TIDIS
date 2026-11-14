@@ -3,11 +3,12 @@
 data/
   raw/YYYY-MM-DD.xlsx              original file as downloaded (allows re-parsing later)
   snapshots/YYYY-MM-DD.parquet     TIDIS rows of that day (the daily "image")
-  forecasts/YYYY-MM-DD_total.parquet    forecast vintage made with data up to that date
-  forecasts/YYYY-MM-DD_buckets.parquet  expected balance at maturity per maturity date
+  forecasts/YYYY-MM-DD_total.parquet    forecast vintage made with data up to that date (both methods)
+  forecasts/YYYY-MM-DD_buckets.parquet  expected balance at maturity per maturity date (both methods)
   catalog.csv                      one row per snapshot (image hash, totals, origin ...)
   forecasts/vintages.csv           one row per forecast vintage (model summary)
   alerts.csv                       every flag ever raised, with first detection time
+  cache/*.parquet                  consolidated copies of the daily files (derived, safe to delete)
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from .source import SNAPSHOT_COLUMNS
 
 CATALOG_COLUMNS = ["snapshot_date", "saved_at", "source_cut_date", "origin", "sha256",
                    "n_rows", "n_imputed_rows", "total_balance"]
-ALERT_COLUMNS = ["date", "category", "severity", "metric", "value", "reference", "message",
+ALERT_COLUMNS = ["date", "category", "severity", "metric", "value", "reference", "change_pct", "message",
                  "key", "first_detected"]
 
 
@@ -34,6 +35,7 @@ def _atomic_write(path: Path, writer) -> None:
     os.close(fd)
     try:
         writer(tmp)
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -129,13 +131,40 @@ class Store:
         df["snapshot_date"] = pd.Timestamp(day).normalize()
         return df
 
+    def _consolidated(self, name: str, keys: dict, date_col: str, read_one) -> pd.DataFrame:
+        """Single-file cache of many daily files. `keys` maps date -> version tag (hash / timestamp);
+        only dates that are new or whose tag changed are re-read from their daily file."""
+        path = self.root / "cache" / f"{name}.parquet"
+        cached = pd.DataFrame()
+        if path.exists():
+            try:
+                cached = _read_parquet(path)
+            except Exception:          # corrupt / incompatible cache: rebuild it
+                cached = pd.DataFrame()
+        if not cached.empty:
+            tags = cached.groupby(date_col)["_tag"].first()
+            valid = [d for d, t in keys.items() if d in tags.index and tags[d] == t]
+            cached = cached[cached[date_col].isin(valid)]
+        else:
+            valid = []
+        missing = [d for d in keys if d not in set(valid)]
+        if missing:
+            fresh = [read_one(d).assign(_tag=keys[d]) for d in missing]
+            cached = _concat([cached] + fresh)
+            if not cached.empty:
+                cached = cached.sort_values(date_col, kind="stable").reset_index(drop=True)
+                _atomic_write(path, lambda p: cached.to_parquet(p, index=False))
+        return cached.drop(columns="_tag", errors="ignore")
+
     def load_snapshots(self, until=None) -> pd.DataFrame:
-        dates = self.snapshot_dates()
-        if until is not None:
-            dates = [d for d in dates if d <= pd.Timestamp(until)]
-        if not dates:
+        cat = self.catalog()
+        if cat.empty:
             return pd.DataFrame(columns=SNAPSHOT_COLUMNS + ["snapshot_date"])
-        return pd.concat([self.load_snapshot(d) for d in dates], ignore_index=True)
+        keys = dict(zip(cat["snapshot_date"], cat["sha256"].fillna("").astype(str)))
+        df = self._consolidated("snapshots", keys, "snapshot_date", self.load_snapshot)
+        if until is not None:
+            df = df[df["snapshot_date"] <= pd.Timestamp(until)]
+        return df.reset_index(drop=True)
 
     def previous_snapshot(self, day) -> pd.DataFrame | None:
         prev = [d for d in self.snapshot_dates() if d < pd.Timestamp(day)]
@@ -167,37 +196,43 @@ class Store:
         _atomic_write(self.vintages_path, lambda p: out.to_csv(p, index=False))
 
     def load_forecasts(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        totals, buckets = [], []
-        for asof in self.vintages()["asof"]:
-            tag = asof.strftime("%Y-%m-%d")
-            t_path, b_path = self.fc_dir / f"{tag}_total.parquet", self.fc_dir / f"{tag}_buckets.parquet"
-            if t_path.exists():
-                totals.append(_read_parquet(t_path).assign(asof=asof))
-            if b_path.exists():
-                buckets.append(_read_parquet(b_path).assign(asof=asof))
-        t = pd.concat(totals, ignore_index=True) if totals else pd.DataFrame(columns=["asof", "target_date", "total"])
-        b = pd.concat(buckets, ignore_index=True) if buckets else pd.DataFrame(columns=["asof", "maturity_date"])
+        v = self.vintages()
+        keys = dict(zip(v["asof"], v["created_at"].astype(str))) if len(v) else {}
+
+        def reader(kind):
+            def read_one(asof):
+                path = self.fc_dir / f"{asof.strftime('%Y-%m-%d')}_{kind}.parquet"
+                return _read_parquet(path).assign(asof=asof) if path.exists() else pd.DataFrame({"asof": [asof]}).iloc[:0]
+            return read_one
+
+        t = self._consolidated("forecast_totals", keys, "asof", reader("total")) if keys else pd.DataFrame()
+        b = self._consolidated("forecast_buckets", keys, "asof", reader("buckets")) if keys else pd.DataFrame()
+        if t.empty:
+            t = pd.DataFrame(columns=["asof", "target_date", "total", "method"])
+        if b.empty:
+            b = pd.DataFrame(columns=["asof", "maturity_date", "method"])
+        for df in (t, b):                       # vintages saved before there were two methods
+            df["method"] = df["method"].fillna("multi") if "method" in df else "multi"
         return t, b
 
     # ------------------------------------------------------------------ alerts
     def alerts(self) -> pd.DataFrame:
         if not self.alerts_path.exists():
             return pd.DataFrame(columns=ALERT_COLUMNS)
-        a = pd.read_csv(self.alerts_path)
+        a = pd.read_csv(self.alerts_path).reindex(columns=ALERT_COLUMNS)   # older logs: no change_pct
         a["date"] = pd.to_datetime(a["date"])
         return a
 
     def save_alerts(self, fresh: pd.DataFrame) -> pd.DataFrame:
-        """Merge freshly computed alerts with the log, preserving first-detection times."""
+        """Replace the log with the freshly computed alerts, preserving first-detection times.
+
+        Alerts are fully reproducible from the saved images and forecasts, so the log always
+        matches the current rules (no stale alerts after a rule change or a rebuild)."""
         old = self.alerts()
         first = dict(zip(old["key"], old["first_detected"])) if len(old) else {}
         stamp = now_local().isoformat(timespec="seconds")
-        fresh = fresh.copy()
-        fresh["first_detected"] = [first.get(k, stamp) for k in fresh["key"]]
-        # keep alerts from the log that can no longer be recomputed (e.g. history rewritten)
-        merged = _concat([fresh, old[~old["key"].isin(fresh["key"])]])
-        if merged.empty:
-            merged = pd.DataFrame(columns=ALERT_COLUMNS)
+        merged = fresh.copy() if len(fresh) else pd.DataFrame(columns=ALERT_COLUMNS)
+        merged["first_detected"] = [first.get(k, stamp) for k in merged["key"]]
         merged = merged[ALERT_COLUMNS].sort_values(["date", "category"], ascending=[False, True])
         out = merged.assign(date=pd.to_datetime(merged["date"]).dt.strftime("%Y-%m-%d"))
         _atomic_write(self.alerts_path, lambda p: out.to_csv(p, index=False))
