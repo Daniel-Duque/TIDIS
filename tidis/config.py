@@ -48,6 +48,8 @@ class Settings:
     dtm_bin_days: int = 30            # days-to-maturity buckets of the shape
     min_bin_transitions: int = 20     # below this, a bucket uses the average rate
     include_new_issuance: bool = True
+    projection_model: str = "ewma"    # how the multi-image drivers are projected (tidis.models):
+                                      # ewma (α smoothing), holt, sarima, var, gbm, rnn, transformer
     issuance_window_days: int = 60    # new issuance = average of the last N days
 
     # --- alerts (all relative to the value they describe) ---------------------

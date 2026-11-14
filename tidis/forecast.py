@@ -104,7 +104,7 @@ class SingleImageIndex:
     issuance_per_day: float = 0.0
     _rates: np.ndarray | None = field(default=None, repr=False)
 
-    def rate_for(self, dtm: np.ndarray) -> np.ndarray:
+    def rate_for(self, dtm: np.ndarray, step: int = 1) -> np.ndarray:
         if self.kind == "runoff" or self._rates is None:
             return np.zeros(len(dtm))
         age = np.clip(self.tenor - np.asarray(dtm), 0, len(self._rates) - 1)
@@ -157,9 +157,22 @@ class MultiImageIndex:
     level: float = 0.0                          # last smoothed daily rate
     issuance_per_day: float = 0.0
     n_transitions: int = 0
+    model: str = "ewma"                         # projection model of the drivers (tidis.models)
+    model_note: str = ""
+    path: pd.DataFrame | None = None            # projected daily rate & issuance (None = flat level)
     _lookup: np.ndarray | None = field(default=None, repr=False)
 
-    def rate_for(self, dtm: np.ndarray) -> np.ndarray:
+    def level_at(self, step: int) -> float:
+        if self.path is None or len(self.path) == 0:
+            return self.level
+        return float(self.path["rate"].iloc[min(step, len(self.path)) - 1])
+
+    def issuance_at(self, step: int) -> float:
+        if self.path is None or len(self.path) == 0:
+            return self.issuance_per_day
+        return float(self.path["issued"].iloc[min(step, len(self.path)) - 1])
+
+    def rate_for(self, dtm: np.ndarray, step: int = 1) -> np.ndarray:
         if self.kind == "runoff":
             return np.zeros(len(dtm))
         if self._lookup is None:
@@ -170,7 +183,7 @@ class MultiImageIndex:
         mult = np.ones(len(idx))
         inside = idx < len(self._lookup)
         mult[inside] = self._lookup[idx[inside]]
-        return np.clip(mult * self.level, 0, 1)
+        return np.clip(mult * self.level_at(step), 0, 1)
 
 
 def daily_depreciation(panel: pd.DataFrame, alive_on_maturity: bool) -> pd.DataFrame:
@@ -220,7 +233,7 @@ def multi_image_index(panel: pd.DataFrame, alive_on_maturity: bool, alpha: float
 
 
 # --------------------------------------------------------------------------- projection
-def project(image: pd.Series, asof, rate_for: Callable[[np.ndarray], np.ndarray], issuance_per_day: float,
+def project(image: pd.Series, asof, rate_for: Callable[..., np.ndarray], issuance: float | Callable[[int], float],
             tenor: int, alive_on_maturity: bool, settings: Settings = SETTINGS):
     """Project an image forward day by day.
 
@@ -234,22 +247,24 @@ def project(image: pd.Series, asof, rate_for: Callable[[np.ndarray], np.ndarray]
     bal = image.values.astype(float).copy()
     n_existing = len(bal)
     at_maturity = np.full(n_existing, np.nan)
-    issue_new = settings.include_new_issuance and issuance_per_day > 0
+    issuance_at = issuance if callable(issuance) else (lambda step, v=float(issuance): v)
+    issue_new = settings.include_new_issuance
     rows = []
     for step in range(1, settings.horizon_days + 1):
         prev_day = asof + pd.Timedelta(days=step - 1)
         day = asof + pd.Timedelta(days=step)
         dtm = ((mats - np.datetime64(prev_day)) // np.timedelta64(1, "D")).astype(int)
-        used = bal * rate_for(dtm)
+        used = bal * rate_for(dtm, step)
         bal = bal - used
         expiring = ~is_alive(mats, day, alive_on_maturity) & (bal > 0)
         matured = float(bal[expiring].sum())
         exp_idx = np.where(expiring[:n_existing])[0]
         at_maturity[exp_idx] = bal[exp_idx]
         bal[expiring] = 0.0
-        if issue_new:
+        new_amount = issuance_at(step) if issue_new else 0.0
+        if new_amount > 0:
             mats = np.append(mats, np.datetime64(day + pd.Timedelta(days=tenor), "ns"))
-            bal = np.append(bal, issuance_per_day)
+            bal = np.append(bal, new_amount)
         rows.append({"target_date": day, "total": float(bal.sum()), "existing": float(bal[:n_existing].sum()),
                      "new_issues": float(bal[n_existing:].sum()), "used": float(used.sum()), "matured": matured})
     total = pd.DataFrame(rows)
@@ -273,9 +288,15 @@ class ForecastResult:
 
 
 def run_forecasts(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.DataFrame,
-                  settings: Settings = SETTINGS, alpha: float | None = None, asof=None) -> ForecastResult:
-    """Both forecasts (single image and multiple images) made with data up to `asof`."""
+                  settings: Settings = SETTINGS, alpha: float | None = None, asof=None,
+                  model: str | None = None) -> ForecastResult:
+    """Both forecasts (single image and multiple images) made with data up to `asof`.
+
+    `model` chooses how the multi-image drivers (daily usage rate and issuance) are projected
+    (see tidis.models); default: settings.projection_model ("ewma" = α smoothing)."""
+    from .models import forecast_drivers
     alpha = settings.alpha if alpha is None else alpha
+    model = settings.projection_model if model is None else model
     asof = panel.index[-1] if asof is None else pd.Timestamp(asof).normalize()
     panel = panel[panel.index <= asof]
     snaps = snapshots[snapshots["snapshot_date"] <= asof]
@@ -283,9 +304,13 @@ def run_forecasts(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.Da
     image = panel.loc[asof]
     single = single_image_index(image, asof, alive_on_maturity, alpha, tenor, settings)
     multi = multi_image_index(panel, alive_on_maturity, alpha, tenor, settings)
+    if multi.kind == "index":
+        multi.path, multi.model, multi.model_note = forecast_drivers(
+            multi.series, settings.horizon_days, model, alpha, settings)
     totals, buckets = [], []
     for name, idx in (("single", single), ("multi", multi)):
-        t, b = project(image, asof, idx.rate_for, idx.issuance_per_day, tenor, alive_on_maturity, settings)
+        issuance = idx.issuance_at if name == "multi" else idx.issuance_per_day
+        t, b = project(image, asof, idx.rate_for, issuance, tenor, alive_on_maturity, settings)
         totals.append(t.assign(method=name))
         buckets.append(b.assign(method=name))
     totals, buckets = pd.concat(totals, ignore_index=True), pd.concat(buckets, ignore_index=True)
@@ -298,7 +323,7 @@ def run_forecasts(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.Da
         "multi_model": multi.kind, "multi_daily_rate": multi.level,
         "multi_daily_rate_raw": float(multi.series["rate"].iloc[-1]) if multi.kind == "index" else 0.0,
         "multi_issuance_per_day": multi.issuance_per_day, "multi_expected_unused": float(unused.get("multi", 0.0)),
-        "n_transitions": multi.n_transitions,
+        "n_transitions": multi.n_transitions, "multi_projection_model": multi.model,
     }
     return ForecastResult(asof, alpha, single, multi, totals, buckets, meta)
 
@@ -307,27 +332,46 @@ def with_options(settings: Settings, **kw) -> Settings:
     return replace(settings, **kw)
 
 
-def calibrate_alpha(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.DataFrame,
-                    observed_totals: pd.Series, alphas=(0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0),
-                    n_points: int = 8, horizon: int = 60, min_history: int = 14,
-                    settings: Settings = SETTINGS) -> pd.DataFrame:
-    """Backtest: forecast from past images (only data up to each of them) and measure the
-    error against images observed later, for each alpha and method."""
+def backtest(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.DataFrame, observed_totals: pd.Series,
+             configs: list[tuple[float, str]], n_points: int = 8, horizon: int = 60, min_history: int = 14,
+             settings: Settings = SETTINGS) -> pd.DataFrame:
+    """Forecast from past images (only with data up to each of them) and measure the mean
+    absolute % error against the images observed later. `configs` = [(alpha, model), ...]."""
     days = list(observed_totals.index)
     cands = [d for d in days if (d - days[0]).days >= min_history and any(x > d for x in days)]
+    cols = ["alpha", "model", "model_used", "method", "mape", "n"]
     if not cands:
-        return pd.DataFrame(columns=["alpha", "method", "mape", "n"])
+        return pd.DataFrame(columns=cols)
     origins = [cands[int(i)] for i in np.unique(np.linspace(0, len(cands) - 1, n_points).round())]
     short = replace(settings, horizon_days=horizon)
     rows = []
-    for alpha in alphas:
+    for alpha, model in configs:
         errs = {m: [] for m in METHODS}
+        used = set()
         for a in origins:
-            res = run_forecasts(panel, alive_on_maturity, snapshots, short, alpha=alpha, asof=a)
+            res = run_forecasts(panel, alive_on_maturity, snapshots, short, alpha=alpha, asof=a, model=model)
+            used.add(res.multi.model)
             for m, g in res.totals.groupby("method"):
                 g = g.set_index("target_date")["total"]
                 common = [d for d in observed_totals.index if a < d <= a + pd.Timedelta(days=horizon) and d in g.index]
                 errs[m] += [abs(g[d] / observed_totals[d] - 1) * 100 for d in common]
-        rows += [{"alpha": alpha, "method": m, "mape": float(np.mean(e)) if e else np.nan, "n": len(e)}
-                 for m, e in errs.items()]
-    return pd.DataFrame(rows)
+        rows += [{"alpha": alpha, "model": model, "model_used": "/".join(sorted(used)), "method": m,
+                  "mape": float(np.mean(e)) if e else np.nan, "n": len(e)} for m, e in errs.items()]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def calibrate_alpha(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.DataFrame,
+                    observed_totals: pd.Series, alphas=(0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0),
+                    n_points: int = 8, horizon: int = 60, settings: Settings = SETTINGS) -> pd.DataFrame:
+    """Backtest of the α smoothing for a grid of α values."""
+    return backtest(panel, alive_on_maturity, snapshots, observed_totals, [(a, "ewma") for a in alphas],
+                    n_points, horizon, settings=settings)
+
+
+def compare_models(panel: pd.DataFrame, alive_on_maturity: bool, snapshots: pd.DataFrame,
+                   observed_totals: pd.Series, models, alpha: float, n_points: int = 6, horizon: int = 60,
+                   settings: Settings = SETTINGS) -> pd.DataFrame:
+    """Backtest of several projection models (multi-image method) with the same α."""
+    res = backtest(panel, alive_on_maturity, snapshots, observed_totals, [(alpha, m) for m in models],
+                   n_points, horizon, min_history=60, settings=settings)
+    return res[res["method"] == "multi"].reset_index(drop=True)

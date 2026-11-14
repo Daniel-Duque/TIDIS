@@ -23,9 +23,11 @@ Everything is **daily**: one image per day, one bucket per maturity date.
 | Comparing images | every change is split into **issued**, **used** (redeemed for taxes before maturity) and **matured unused**, per maturity date; the three add up exactly to the change | `tidis/analysis.py` |
 | Depreciation index | **single image**: balance by days since issue inside one image → curve 100 → x at maturity. **Multiple images**: daily fraction of the live stock used, chained into an index over time. Both are smoothed with **α** (weight of the newest day: small α = softer trend, 1 = no smoothing) | `tidis/forecast.py` |
 | Forecasts | both indices are projected per maturity date (depreciation, maturity, new issuance). One forecast per image and method is saved once and never overwritten (`data/forecasts/`), so the forecasts have their own history and measured accuracy. α can be changed live on the page and calibrated with a backtest | `tidis/forecast.py` |
+| Projection models | how the multi-image drivers (daily usage rate and issuance) are projected: **α smoothing (default)**, damped Holt, weekly SARIMA, VAR, gradient boosting, RNN (GRU) and Transformer. Every model feeds the same projection by maturity date; the last three use lags + calendar (tax deadlines). RNN and Transformer are implemented in NumPy (`tidis/nn.py`, gradient-checked in the tests) so no deep-learning package is needed. Chosen in the sidebar; compared and backtested on the page | `tidis/models.py`, `tidis/nn.py` |
 | Alerts | all **relative** to the value they describe, and the text says by how much: usage/issuance (% of balance) vs its smoothed level, daily change of the total, shift of the smoothed depreciation rate, forecast revisions, error of the previous forecast, single vs multiple-image gap, imputed days/rows. Stored in `data/alerts.csv` with the value, reference, % change and first-detection time | `tidis/alerts.py` |
 
-All thresholds and model parameters (α included) are in `tidis/config.py`.
+All thresholds and model parameters (α and the model used for the saved forecasts, `projection_model`)
+are in `tidis/config.py`.
 
 ## Daily images: schedule `collect.py`
 

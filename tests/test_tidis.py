@@ -215,3 +215,70 @@ def test_page_recovers_from_code_loaded_by_a_previous_version(history, monkeypat
     assert not at.exception, [e.value for e in at.exception]
     assert sys.modules["tidis"] is not stale                      # package was re-imported
     assert len(at.tabs) == 7
+
+
+# ----------------------------------------------------------------------------- projection models
+from tidis.models import PROJECTION_MODELS, forecast_drivers  # noqa: E402
+from tidis.nn import GRU, T, Transformer, train  # noqa: E402
+
+
+@pytest.mark.parametrize("net", ["gru", "transformer"])
+def test_neural_network_gradients_match_finite_differences(net):
+    rng = np.random.default_rng(1)
+    X, Y = rng.normal(size=(4, 6, 3)), rng.normal(size=(4, 2))
+    model = GRU(3, 2, hidden=4, seed=2) if net == "gru" else Transformer(3, 2, d_model=4, heads=2, layers=1, window=6, seed=3)
+
+    def loss():
+        e = model(T(X)) - T(Y)
+        return (e * e).mean()
+    loss().backward()
+    for p in model.params():
+        g, flat = p.grad.copy().reshape(-1), p.data.reshape(-1)
+        for i in range(min(4, flat.size)):
+            old = flat[i]
+            flat[i] = old + 1e-6
+            up = loss().data
+            flat[i] = old - 1e-6
+            down = loss().data
+            flat[i] = old
+            assert (up - down) / 2e-6 == pytest.approx(g[i], rel=1e-4, abs=1e-8)
+        p.grad = None
+
+
+@pytest.mark.parametrize("net", ["gru", "transformer"])
+def test_neural_networks_learn_a_weekly_pattern(net):
+    t = np.arange(200)
+    z = np.sin(2 * np.pi * t / 7)[:, None]
+    W = 14
+    X = np.array([z[j - W:j] for j in range(W, 200)])
+    Y = z[W:]
+    model = GRU(1, 1, hidden=8, seed=0) if net == "gru" else Transformer(1, 1, d_model=8, heads=2, layers=1, window=W, seed=0)
+    train(model, X, Y, epochs=150, lr=0.01, val_frac=0.0)
+    mse = float(((model(T(X)).data - Y) ** 2).mean())
+    assert mse < 0.05 * float(Y.var())            # explains > 95% of the variance
+
+
+def test_every_projection_model_gives_a_valid_path(history):
+    _, _, h = history
+    for key in PROJECTION_MODELS:
+        path, used, note = forecast_drivers(h.index.series, 120, key)
+        assert used == key, (key, note)
+        assert len(path) == 120 and np.isfinite(path.values).all() and (path.values >= 0).all()
+        assert path.index[0] == h.index.series.index[-1] + pd.Timedelta(days=1)
+
+
+def test_short_history_falls_back_to_alpha_smoothing(history):
+    _, _, h = history
+    path, used, note = forecast_drivers(h.index.series.iloc[:20], 30, "transformer")
+    assert used == "ewma" and "60 días" in note
+
+
+def test_default_projection_is_the_alpha_smoothing(history):
+    store, _, h = history
+    snaps = store.load_snapshots()
+    default = run_forecasts(h.panel, h.alive_on_maturity, snaps)
+    assert default.multi.model == "ewma"
+    assert np.allclose(default.multi.path["rate"], default.multi.level)
+    other = run_forecasts(h.panel, h.alive_on_maturity, snaps, model="var")
+    assert other.multi.model == "var"
+    assert not np.allclose(other.totals["total"], default.totals["total"])

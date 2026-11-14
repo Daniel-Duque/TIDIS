@@ -4,3 +4,5 @@ numpy
 openpyxl
 pyarrow
 altair>=5
+statsmodels>=0.14
+scikit-learn>=1.3

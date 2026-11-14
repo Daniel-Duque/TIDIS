@@ -38,7 +38,8 @@ from tidis import pipeline  # noqa: E402
 from tidis.alerts import METRIC_LABELS, SEV_ORDER, forecast_accuracy  # noqa: E402
 from tidis.analysis import compare_images  # noqa: E402
 from tidis.config import SETTINGS, SOURCE_URL  # noqa: E402
-from tidis.forecast import METHODS, calibrate_alpha, run_forecasts, with_options  # noqa: E402
+from tidis.forecast import METHODS, calibrate_alpha, compare_models, run_forecasts, with_options  # noqa: E402
+from tidis.models import PROJECTION_MODELS, is_available  # noqa: E402
 from tidis.storage import Store  # noqa: E402
 
 tidis.__code_version__ = CODE_VERSION
@@ -81,11 +82,19 @@ def load(version: float, code: str = CODE_VERSION) -> pipeline.History:
     return h
 
 
-@st.cache_data(show_spinner="Calculando índices y predicciones…", max_entries=64)
-def live_forecast(version: float, asof: pd.Timestamp, alpha: float, new_issues: bool, code: str = CODE_VERSION):
+@st.cache_data(show_spinner="Calculando índices y predicciones (los modelos neuronales tardan unos segundos)…",
+               max_entries=64)
+def live_forecast(version: float, asof: pd.Timestamp, alpha: float, new_issues: bool, model: str = "ewma",
+                  code: str = CODE_VERSION):
     h = load(version, code)
     return run_forecasts(h.panel, h.alive_on_maturity, h.snapshots,
-                         with_options(SETTINGS, include_new_issuance=new_issues), alpha=alpha, asof=asof)
+                         with_options(SETTINGS, include_new_issuance=new_issues), alpha=alpha, asof=asof, model=model)
+
+
+@st.cache_data(show_spinner="Backtest de los modelos de proyección…", max_entries=8)
+def models_backtest(version: float, models: tuple, alpha: float, code: str = CODE_VERSION) -> pd.DataFrame:
+    h = load(version, code)
+    return compare_models(h.panel, h.alive_on_maturity, h.snapshots, h.actual_obs, list(models), alpha)
 
 
 @st.cache_data(show_spinner="Probando valores de α con la historia (backtest)…", max_entries=8)
@@ -169,10 +178,18 @@ base_day = st.sidebar.selectbox("Imagen base", obs_days[::-1], format_func=lambd
 alpha = st.sidebar.slider("Suavizado α del índice de depreciación", 0.01, 1.0, float(SETTINGS.alpha), 0.01,
                           help="Peso del dato más reciente. α pequeño = tendencia más suave (memoria larga); "
                                "α = 1 = sin suavizar.")
+model_keys = list(PROJECTION_MODELS)
+proj_model = st.sidebar.selectbox(
+    "Modelo de proyección (varias imágenes)", model_keys, index=model_keys.index(SETTINGS.projection_model),
+    format_func=lambda k: PROJECTION_MODELS[k].label + ("" if is_available(k) else " (no disponible)"),
+    help="Cómo se proyectan hacia adelante el uso diario y la emisión. El suavizado α es el predeterminado.")
+spec = PROJECTION_MODELS[proj_model]
+st.sidebar.caption(spec.description + (" Usa α." if spec.uses_alpha else " No usa α (ajusta su propia dinámica)."))
 new_issues = st.sidebar.checkbox("Incluir nuevas emisiones", value=SETTINGS.include_new_issuance)
-if abs(alpha - SETTINGS.alpha) > 1e-9:
-    st.sidebar.caption(f"Las predicciones guardadas y las alertas usan α = {SETTINGS.alpha:g} (config).")
-fc = live_forecast(version, base_day, alpha, new_issues, CODE_VERSION)
+if abs(alpha - SETTINGS.alpha) > 1e-9 or proj_model != SETTINGS.projection_model:
+    st.sidebar.caption(f"Las predicciones guardadas y las alertas usan α = {SETTINGS.alpha:g} y "
+                       f"{PROJECTION_MODELS[SETTINGS.projection_model].label} (config).")
+fc = live_forecast(version, base_day, alpha, new_issues, proj_model, CODE_VERSION)
 
 st.sidebar.divider()
 st.sidebar.caption(f"Fuente: [archivo de títulos vigentes]({SOURCE_URL})  \n"
@@ -493,7 +510,11 @@ with tabs[3]:
 
 # --------------------------------------------------------------------------- tab: forecasts
 with tabs[4]:
+    used_label = PROJECTION_MODELS[fc.multi.model].label
     st.subheader(f"Predicción del saldo total desde la imagen del {base_day.date()} (α = {alpha:g})")
+    st.caption(f"Varias imágenes proyectadas con **{used_label}**; una imagen con su índice suavizado con α.")
+    if fc.multi.model_note:
+        st.info(fc.multi.model_note)
     horizon = st.slider("Horizonte (días)", 30, SETTINGS.horizon_days, 180, step=30)
     tot = fc.totals[fc.totals["target_date"] <= base_day + pd.Timedelta(days=horizon)].copy()
     tot["método"] = tot["method"].map(METHODS)
@@ -537,7 +558,81 @@ with tabs[4]:
     for i, (mk, mname) in enumerate(METHODS.items()):
         mcols[2 * i].metric(f"Vencerá sin usarse · {mname}", mm(fc.meta[f"{mk}_expected_unused"]),
                             help=f"{100 * fc.meta[f'{mk}_expected_unused'] / fc.meta['balance_asof']:.1f}% del saldo de la imagen base")
-        mcols[2 * i + 1].metric(f"Emisión diaria · {mname}", mm(fc.meta[f"{mk}_issuance_per_day"]))
+        iss = (fc.multi.path["issued"].iloc[:90].mean() if mk == "multi" and fc.multi.path is not None
+               else fc.meta[f"{mk}_issuance_per_day"])
+        mcols[2 * i + 1].metric(f"Emisión diaria · {mname}", mm(iss), help="Promedio de los próximos 90 días")
+
+    if fc.multi.kind == "index" and fc.multi.path is not None:
+        st.markdown(f"**Motores proyectados con {used_label}** — uso diario (% del saldo) y emisión diaria")
+        past = fc.multi.series[fc.multi.series.index > base_day - pd.Timedelta(days=horizon)]
+        fut = fc.multi.path[fc.multi.path.index <= base_day + pd.Timedelta(days=horizon)]
+        drv = pd.concat([past[["rate", "issued"]].assign(tipo="observado"), fut.assign(tipo="proyectado")])
+        drv = drv.rename_axis("date").reset_index()
+        drv["issued"] /= UNIT
+        cap_r = float(np.nanquantile(drv["rate"], 0.98) * 1.5) if drv["rate"].notna().any() else None
+        dc = st.columns(2)
+        for col, field, title, fmt in ((dc[0], "rate", "Uso diario", "%"), (dc[1], "issued", f"Emisión ({UNIT_LABEL})", ",.1f")):
+            y = alt.Y(f"{field}:Q", title=title, axis=alt.Axis(format=fmt),
+                      scale=alt.Scale(domain=[0, cap_r], clamp=True) if field == "rate" and cap_r else alt.Undefined)
+            col.altair_chart(alt.Chart(drv).mark_line(clip=True).encode(
+                x=alt.X("date:T", title=None), y=y,
+                color=alt.Color("tipo:N", title=None, scale=alt.Scale(domain=["observado", "proyectado"],
+                                                                    range=["#999999", "#4c78a8"])),
+                tooltip=[alt.Tooltip("date:T", title="día"), "tipo",
+                         alt.Tooltip(f"{field}:Q", format=".3%" if field == "rate" else ",.2f")]).properties(height=220),
+                width="stretch")
+
+    with st.expander("Comparar modelos de proyección", expanded=False):
+        st.caption("Cada modelo proyecta el uso diario y la emisión; la proyección por fecha de vencimiento es la misma. "
+                   "Los modelos neuronales se entrenan al elegirlos (unos segundos).")
+        avail = [k for k in PROJECTION_MODELS if is_available(k)]
+        chosen = st.multiselect("Modelos", avail, default=list(dict.fromkeys(["ewma", proj_model])),
+                                format_func=lambda k: PROJECTION_MODELS[k].label)
+        if chosen:
+            lines, rows_cmp = [], []
+            for k in chosen:
+                r = live_forecast(version, base_day, alpha, new_issues, k, CODE_VERSION)
+                g = r.totals[r.totals["method"] == "multi"]
+                lines.append(g.assign(modelo=PROJECTION_MODELS[r.multi.model].label))
+                row = {"Modelo": PROJECTION_MODELS[k].label}
+                gi = g.set_index("target_date")["total"]
+                for hz in (30, 90, 180):
+                    t = base_day + pd.Timedelta(days=hz)
+                    row[f"+{hz} d"] = gi[t] / UNIT if t in gi.index else np.nan
+                row["Vencerá sin usarse"] = r.meta["multi_expected_unused"] / UNIT
+                row["Nota"] = r.multi.model_note
+                rows_cmp.append(row)
+            ln = pd.concat(lines)
+            ln = ln[ln["target_date"] <= base_day + pd.Timedelta(days=horizon)].assign(v=lambda x: x["total"] / UNIT)
+            st.altair_chart(alt.layer(
+                alt.Chart(hist).mark_line(color="black").encode(
+                    x=alt.X("date:T", title=None), y=alt.Y("v:Q", title=f"Saldo ({UNIT_LABEL})", scale=alt.Scale(zero=False))),
+                alt.Chart(ln).mark_line().encode(
+                    x="target_date:T", y="v:Q", color=alt.Color("modelo:N", title="Modelo"),
+                    tooltip=["modelo", alt.Tooltip("target_date:T", title="fecha"), alt.Tooltip("v:Q", format=",.2f")]),
+            ), width="stretch")
+            tbl = pd.DataFrame(rows_cmp).set_index("Modelo")
+            if not tbl["Nota"].astype(bool).any():
+                tbl = tbl.drop(columns="Nota")
+            st.dataframe(tbl, column_config={c: st.column_config.NumberColumn(format="%.2f")
+                                             for c in tbl.columns if c != "Nota"})
+            st.caption(f"Saldos en {UNIT_LABEL}.")
+            if len(obs_days) < 75:
+                st.info("El backtest de modelos necesita al menos 75 imágenes.")
+            elif st.button("Backtest de los modelos elegidos"):
+                st.session_state["models_bt"] = tuple(chosen)
+            bt_models = st.session_state.get("models_bt")
+            if bt_models and len(obs_days) >= 75:
+                bt = models_backtest(version, bt_models, alpha, CODE_VERSION)
+                bt["Modelo"] = bt["model"].map(lambda k: PROJECTION_MODELS[k].label)
+                st.altair_chart(alt.Chart(bt).mark_bar().encode(
+                    x=alt.X("mape:Q", title="Error medio absoluto del saldo total (%) · 60 días"),
+                    y=alt.Y("Modelo:N", sort="x", title=None),
+                    tooltip=["Modelo", alt.Tooltip("mape:Q", format=".2f"), "n", "model_used"]), width="stretch")
+                best = bt.loc[bt["mape"].idxmin()]
+                st.markdown(f"Mejor en el backtest: **{best['Modelo']}** ({best['mape']:.2f}% de error medio, "
+                            f"α = {alpha:g}). Predice desde 6 imágenes pasadas usando solo la información disponible "
+                            "en cada una.")
 
     st.markdown("**Destino esperado del saldo de la imagen base, por fecha de vencimiento**")
     dm = st.segmented_control("Método", list(METHODS.values()), default=METHODS["multi"], key="dest")
@@ -623,6 +718,10 @@ with tabs[4]:
   {SETTINGS.lookback_days} días.
 * **α**: peso del dato más reciente. α pequeño = tendencia suave y memoria larga; α = 1 = sin suavizar.
   La pestaña *Índice de depreciación* permite calibrarlo con la historia.
+* **Modelos de proyección** (varias imágenes): proyectan el uso diario y la emisión; luego la proyección por fecha de
+  vencimiento es la misma para todos. Suavizado α (predeterminado), Holt amortiguado (α + tendencia), SARIMA semanal,
+  VAR (uso y emisión conjuntos), gradient boosting, RNN (GRU) y Transformer (estos tres con rezagos y calendario, que
+  permite aprender las fechas tributarias). Se entrenan con escalado robusto para que un choque aislado no los domine.
 * Cada vencimiento se proyecta día a día; al llegar su fecha, lo que quede **vence sin usarse**. Las nuevas emisiones se
   suman al promedio diario de los últimos {SETTINGS.issuance_window_days} días.
 * Las predicciones guardadas (una por imagen, con α = {SETTINGS.alpha:g}) no se reescriben, para ver cómo cambian y medir
