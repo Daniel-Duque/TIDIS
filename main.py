@@ -7,17 +7,41 @@ Run the same cycle without the page with:  python collect.py
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import sys
+from pathlib import Path
+
 import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from tidis import pipeline
-from tidis.alerts import METRIC_LABELS, SEV_ORDER, forecast_accuracy
-from tidis.analysis import compare_images
-from tidis.config import SETTINGS, SOURCE_URL
-from tidis.forecast import METHODS, calibrate_alpha, run_forecasts, with_options
-from tidis.storage import Store
+
+def code_version() -> str:
+    """Fingerprint of the tidis package source."""
+    files = sorted((Path(__file__).resolve().parent / "tidis").glob("*.py"))
+    return hashlib.sha256(b"".join(f.read_bytes() for f in files)).hexdigest()[:16]
+
+
+# Streamlit Cloud keeps the Python process alive when new code is pulled: it re-runs this script,
+# but modules already imported (tidis.*) and st.cache_data results stay in memory. If they come
+# from another version of the code, throw them away so the new code is really used.
+CODE_VERSION = code_version()
+if "tidis" in sys.modules and getattr(sys.modules["tidis"], "__code_version__", None) != CODE_VERSION:
+    for _name in [m for m in sys.modules if m == "tidis" or m.startswith("tidis.")]:
+        del sys.modules[_name]
+    st.cache_data.clear()
+
+import tidis  # noqa: E402
+from tidis import pipeline  # noqa: E402
+from tidis.alerts import METRIC_LABELS, SEV_ORDER, forecast_accuracy  # noqa: E402
+from tidis.analysis import compare_images  # noqa: E402
+from tidis.config import SETTINGS, SOURCE_URL  # noqa: E402
+from tidis.forecast import METHODS, calibrate_alpha, run_forecasts, with_options  # noqa: E402
+from tidis.storage import Store  # noqa: E402
+
+tidis.__code_version__ = CODE_VERSION
 
 st.set_page_config(page_title="Monitor TIDIS", page_icon="📉", layout="wide")
 
@@ -50,7 +74,7 @@ def auto_fetch(hour_key: str) -> dict:
 
 
 @st.cache_data(show_spinner="Reconstruyendo la historia de los TIDIS…")
-def load(version: float) -> pipeline.History:
+def load(version: float, code: str = CODE_VERSION) -> pipeline.History:
     h = pipeline.load_history(store)
     if not h.empty:
         h.alerts = pipeline.refresh_alerts(store, h)
@@ -58,15 +82,15 @@ def load(version: float) -> pipeline.History:
 
 
 @st.cache_data(show_spinner="Calculando índices y predicciones…", max_entries=64)
-def live_forecast(version: float, asof: pd.Timestamp, alpha: float, new_issues: bool):
-    h = load(version)
+def live_forecast(version: float, asof: pd.Timestamp, alpha: float, new_issues: bool, code: str = CODE_VERSION):
+    h = load(version, code)
     return run_forecasts(h.panel, h.alive_on_maturity, h.snapshots,
                          with_options(SETTINGS, include_new_issuance=new_issues), alpha=alpha, asof=asof)
 
 
 @st.cache_data(show_spinner="Probando valores de α con la historia (backtest)…", max_entries=8)
-def calibration(version: float) -> pd.DataFrame:
-    h = load(version)
+def calibration(version: float, code: str = CODE_VERSION) -> pd.DataFrame:
+    h = load(version, code)
     return calibrate_alpha(h.panel, h.alive_on_maturity, h.snapshots, h.actual_obs)
 
 
@@ -122,7 +146,14 @@ with st.sidebar.expander("Agregar archivo histórico"):
 
 n_new = pipeline.refresh_forecasts(store)   # forecast vintage for every new image (write-once)
 version = data_version()
-h = load(version)
+h = load(version, CODE_VERSION)
+if any(not hasattr(h, f.name) for f in dataclasses.fields(pipeline.History)):
+    # object cached by an incompatible version of the code: drop every cached result and rebuild
+    st.cache_data.clear()
+    h = load(version, CODE_VERSION)
+    if any(not hasattr(h, f.name) for f in dataclasses.fields(pipeline.History)):
+        st.error("La aplicación cargó una versión antigua del código. Reiníciela (Manage app → Reboot app).")
+        st.stop()
 
 st.title("TIDIS: evolución diaria, depreciación, predicciones y alertas")
 if h.empty:
@@ -141,7 +172,7 @@ alpha = st.sidebar.slider("Suavizado α del índice de depreciación", 0.01, 1.0
 new_issues = st.sidebar.checkbox("Incluir nuevas emisiones", value=SETTINGS.include_new_issuance)
 if abs(alpha - SETTINGS.alpha) > 1e-9:
     st.sidebar.caption(f"Las predicciones guardadas y las alertas usan α = {SETTINGS.alpha:g} (config).")
-fc = live_forecast(version, base_day, alpha, new_issues)
+fc = live_forecast(version, base_day, alpha, new_issues, CODE_VERSION)
 
 st.sidebar.divider()
 st.sidebar.caption(f"Fuente: [archivo de títulos vigentes]({SOURCE_URL})  \n"
@@ -450,7 +481,7 @@ with tabs[3]:
         elif st.button("Calibrar α"):
             st.session_state["calib"] = True
         if st.session_state.get("calib") and len(obs_days) >= 20:
-            cal = calibration(version)
+            cal = calibration(version, CODE_VERSION)
             cal["método"] = cal["method"].map(METHODS)
             st.altair_chart(alt.Chart(cal).mark_line(point=True).encode(
                 x=alt.X("alpha:Q", title="α", scale=alt.Scale(type="log")), y=alt.Y("mape:Q", title="Error medio absoluto (%)"),

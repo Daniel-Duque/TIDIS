@@ -199,3 +199,19 @@ def test_streamlit_page_renders(history, monkeypatch):
     at = AppTest.from_file(str(ROOT / "main.py"), default_timeout=180).run()
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.tabs) == 7
+
+
+def test_page_recovers_from_code_loaded_by_a_previous_version(history, monkeypatch):
+    """Streamlit Cloud keeps the process alive on `git push`: modules imported by the old code stay in
+    sys.modules. The page must detect it, drop them and use the new code instead of crashing."""
+    from streamlit.testing.v1 import AppTest
+    import tidis
+    store, _, _ = history
+    monkeypatch.setenv("TIDIS_DATA_DIR", str(store.root))
+    monkeypatch.setattr(source, "download", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    stale = sys.modules["tidis"]
+    stale.__code_version__ = "from-an-older-release"
+    at = AppTest.from_file(str(ROOT / "main.py"), default_timeout=180).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert sys.modules["tidis"] is not stale                      # package was re-imported
+    assert len(at.tabs) == 7
